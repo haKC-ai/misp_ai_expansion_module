@@ -1,19 +1,26 @@
-# MISP AI Event Analysis Expansion Module
-
-
+# MISP AIModule
+```
+___  ________ ___________    ___  ________  ___          _       _      
+|  \/  |_   _/  ___| ___ \  / _ \|_   _|  \/  |         | |     | |     
+| .  . | | | \ `--.| |_/ / / /_\ \ | | | .  . | ___   __| |_   _| | ___ 
+| |\/| | | |  `--. \  __/  |  _  | | | | |\/| |/ _ \ / _` | | | | |/ _ \
+| |  | |_| |_/\__/ / |     | | | |_| |_| |  | | (_) | (_| | |_| | |  __/
+\_|  |_/\___/\____/\_|     \_| |_/\___/\_|  |_/\___/ \__,_|\__,_|_|\___|
+```
 
 ```
-misp-ai-expansion/
-├── modules/
-│   └── expansion/
-│       └── ai_event_analysis.py        
-├── tools/
-│   └── misp_server_prep.py             
-├── requirements.txt                    
-├── installer.sh                        
-├── .env.example 
-├── README.md                      
-└── exclude_types  
+.
+├── README.md
+├── dev_misp_builder
+│   ├── README.md
+│   └── misp_dev_builder_installer_hardened.sh
+├── modules
+│   └── expansion
+│       └── ai_event_analysis.py
+├── requirements.txt
+├── sample_exclude_types.csv
+└── tools
+    └── misp_server_prep.py
 ```
 
 ## What it does
@@ -141,8 +148,11 @@ You can create and use a dedicated MISP Organisation for AI outputs, for example
 
 ## Install
 
+While this *SHOULD* be production friendly, I highly recommend testing first on a development environment.
+
+
 ```bash
-git clone <this-repo>
+git clone https://github.com/haKC-ai/misp_ai_expansion_module.git
 cd misp-ai-expansion
 ./installer.sh --prep
 ````
