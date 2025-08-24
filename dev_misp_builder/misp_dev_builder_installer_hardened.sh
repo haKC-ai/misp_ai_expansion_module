@@ -35,6 +35,14 @@ INSIDE_APP_CLONE_DIR="${INSIDE_APP_CLONE_DIR:-/opt/misp-ai-expansion}"
 DOCKER_UNINSTALL="${DOCKER_UNINSTALL:-false}"   # remove Docker only if this script installed it
 NONINTERACTIVE="${NONINTERACTIVE:-false}"       # skip confirmations in destroy mode
 
+# Build behavior (default false to avoid local builds)
+FORCE_BUILD="${FORCE_BUILD:-false}"
+
+# Runtime bind + URL (auto-detected; can override)
+HOST_BIND_ADDR="${HOST_BIND_ADDR:-0.0.0.0}"
+HOST_HTTP_PORT="${HOST_HTTP_PORT:-}"            # if empty we will choose 80 or 8081+
+MISP_FORCED_BASEURL="${MISP_FORCED_BASEURL:-}"  # if empty we will compute
+
 DEBUG="${DEBUG:-0}"
 
 # =========================================
@@ -180,15 +188,118 @@ clone_repo() {
   log "Clone OK"
 }
 
-# Ensure env defaults required by misp-docker on master branch
-ensure_env_defaults_for_master() {
-  local envf=".env"
-  grep -q '^CORE_COMMIT=' "$envf" || echo "CORE_COMMIT=master" >> "$envf"
-  grep -q '^MODULES_COMMIT=' "$envf" || echo "MODULES_COMMIT=master" >> "$envf"
-  grep -q '^DISABLE_SSL_REDIRECT=' "$envf" || echo "DISABLE_SSL_REDIRECT=true" >> "$envf"
-  grep -q '^DISABLE_CA_REFRESH='  "$envf" || echo "DISABLE_CA_REFRESH=true"  >> "$envf"
-  grep -q '^MISP_BASEURL=' "$envf" || echo "MISP_BASEURL=https://0.0.0.0" >> "$envf"
+# ---------- Port & URL selection ----------
+is_port_free() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ! ss -ltn 2>/dev/null | awk '{print $4}' | grep -E "[:.]${port}\$" -q
+  elif command -v lsof >/dev/null 2>&1; then
+    ! lsof -iTCP -sTCP:LISTEN -P 2>/dev/null | awk '{print $9}' | grep -E "[:.]${port}\$" -q
+  else
+    ! (nc -z 127.0.0.1 "$port" 2>/dev/null || nc -z ::1 "$port" 2>/dev/null)
+  fi
 }
+
+choose_host_port() {
+  if [ -n "${HOST_HTTP_PORT:-}" ]; then
+    log "HOST_HTTP_PORT pre-set: $HOST_HTTP_PORT"
+    return
+  fi
+  if is_port_free 80; then
+    HOST_HTTP_PORT=80
+    log "Port 80 is free; will use 80"
+  else
+    for p in $(seq 8081 8099); do
+      if is_port_free "$p"; then HOST_HTTP_PORT="$p"; log "Port 80 busy; selected open port $HOST_HTTP_PORT"; break; fi
+    done
+    [ -n "${HOST_HTTP_PORT:-}" ] || fail "No open port found in 8081-8099 range"
+  fi
+}
+
+# Try to determine a public address for this VM (domain wins if provided)
+detect_public_addr() {
+  if [ -n "${PUBLIC_DOMAIN:-}" ]; then
+    echo "$PUBLIC_DOMAIN"
+    return 0
+  fi
+
+  # 1) metadata/what-is-my-ip services (fast path; ignore failures)
+  for svc in \
+    "https://api.ipify.org" \
+    "https://ifconfig.me/ip" \
+    "https://ipv4.icanhazip.com" ; do
+    ip="$(curl -4 -fs --max-time 3 "$svc" | tr -d '\r\n ' || true)"
+    if printf '%s' "$ip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+      echo "$ip"; return 0
+    fi
+  done
+
+  # 2) routing trick (no external call)
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
+  if printf '%s' "$ip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+    echo "$ip"; return 0
+  fi
+
+  # 3) last resort: first non-loopback
+  ip="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i!="127.0.0.1") {print $i; exit}}')"
+  [ -n "$ip" ] && echo "$ip" || echo "127.0.0.1"
+}
+
+
+
+compute_baseurl() {
+  if [ -z "${MISP_FORCED_BASEURL:-}" ]; then
+    host="$(detect_public_addr)"
+    scheme="http"
+    # if you’re enabling the Caddy/TLS proxy, we’ll advertise https
+    if [ "${HARDEN_TLS:-false}" = "true" ] && [ -n "${PUBLIC_DOMAIN:-}" ]; then
+      scheme="https"
+    fi
+    if [ "$HOST_HTTP_PORT" = "80" ] || [ "$scheme" = "https" ]; then
+      MISP_FORCED_BASEURL="${scheme}://${host}"
+    else
+      MISP_FORCED_BASEURL="${scheme}://${host}:${HOST_HTTP_PORT}"
+    fi
+    log "Computed MISP_FORCED_BASEURL: ${MISP_FORCED_BASEURL}"
+  else
+    log "MISP_FORCED_BASEURL pre-set: ${MISP_FORCED_BASEURL}"
+  fi
+}
+
+
+ensure_env_defaults_prebuilt() {
+  local envf=".env"
+  sed -i '/^CORE_COMMIT=/d' "$envf" || true
+  sed -i '/^MODULES_COMMIT=/d' "$envf" || true
+  grep -q '^CORE_TAG=' "$envf"     || echo "CORE_TAG=${CORE_TAG:-latest}" >> "$envf"
+  grep -q '^MODULES_TAG=' "$envf"  || echo "MODULES_TAG=${MODULES_TAG:-latest}" >> "$envf"
+
+  # kill https redirects in the container images
+  grep -q '^DISABLE_SSL_REDIRECT=' "$envf" || echo "DISABLE_SSL_REDIRECT=true" >> "$envf"
+  grep -q '^DISABLE_CA_REFRESH='  "$envf"  || echo "DISABLE_CA_REFRESH=true"  >> "$envf"
+  grep -q '^HSTS_MAX_AGE='        "$envf"  || echo "HSTS_MAX_AGE=0"           >> "$envf"
+  grep -q '^FORCE_HTTPS='         "$envf"  || echo "FORCE_HTTPS=false"        >> "$envf"
+  grep -q '^ENABLE_SSL='          "$envf"  || echo "ENABLE_SSL=false"         >> "$envf"
+
+  # prefer your domain when provided (e.g., hakc.ai), else computed public IP
+  if [ -n "$PUBLIC_DOMAIN" ]; then
+    if [ "${HARDEN_TLS:-false}" = "true" ]; then
+      scheme="https"
+    else
+      scheme="http"
+    fi
+    url="${scheme}://${PUBLIC_DOMAIN}"
+  else
+    url="$MISP_FORCED_BASEURL"
+  fi
+
+
+  # set all three envs so init script never falls back to https://localhost
+  safe_kv_set "$envf" "MISP_BASEURL" "$url"
+  safe_kv_set "$envf" "MISP_EXTERNAL_BASEURL" "$url"
+  safe_kv_set "$envf" "SECURITY_REST_CLIENT_BASEURL" "$url"
+}
+
 
 prepare_env() {
   cd "$TARGET_DIR"
@@ -200,7 +311,7 @@ prepare_env() {
   else
     log ".env already exists. Leaving as is."
   fi
-  ensure_env_defaults_for_master
+  ensure_env_defaults_prebuilt
 }
 
 baseline_hardening_env() {
@@ -221,12 +332,6 @@ baseline_hardening_env() {
   safe_kv_set "$envf" "REDIS_PASSWORD" "$redis_pw"
   safe_kv_set "$envf" "MISP_SALT" "$salt"
 
-  if [ -n "$PUBLIC_DOMAIN" ]; then
-    safe_kv_set "$envf" "MISP_BASEURL" "https://${PUBLIC_DOMAIN}"
-  else
-    safe_kv_set "$envf" "MISP_BASEURL" "https://0.0.0.0"
-  fi
-
   umask 077
   {
     echo "MISP_ADMIN_EMAIL=$admin_email"
@@ -243,7 +348,8 @@ baseline_hardening_env() {
 }
 
 write_compose_override() {
-  cat > docker-compose.override.yml <<'YAML'
+  # always overwrite in TARGET_DIR (we're already cd'ed there)
+  cat > docker-compose.override.yml <<YAML
 services:
   misp-modules:
     ports: []     # keep internal only
@@ -252,9 +358,12 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
   misp-core:
     depends_on:
       - misp-modules
+    ports:
+      - "${HOST_BIND_ADDR}:${HOST_HTTP_PORT}:80"
     logging:
       driver: json-file
       options:
@@ -262,7 +371,9 @@ services:
         max-file: "5"
 YAML
   record_state wrote_override "1"
-  log "Wrote docker-compose.override.yml"
+  log "Wrote docker-compose.override.yml (host ${HOST_BIND_ADDR}:${HOST_HTTP_PORT} -> container 80)"
+  log "Override ports stanza (sanity):"
+  awk '/misp-core:/,0' docker-compose.override.yml | sed -n '1,20p' | tee -a "$LOG_FILE"
 }
 
 # Inspect rendered compose to see if images are defined
@@ -273,14 +384,20 @@ config_has_images() {
   echo "$cfg" | awk '/services:/,/^$/' | grep -A6 'misp-modules:' | grep -q 'image:'
 }
 
-# Build locally if image entries are not present
+# Build locally only if forced (default is to use prebuilt images)
 maybe_build_images() {
-  if config_has_images; then
-    log "Compose model contains images for misp-core and misp-modules. No build needed."
+  if [ "$FORCE_BUILD" = "true" ]; then
+    log "FORCE_BUILD=true -> building misp-core and misp-modules locally"
+    $COMPOSE_BIN build misp-core misp-modules | tee -a "$LOG_FILE"
     return 0
   fi
-  log "Compose model lacks image entries. Performing one-time local build for misp-core and misp-modules."
-  $COMPOSE_BIN build misp-core misp-modules | tee -a "$LOG_FILE"
+  if config_has_images; then
+    log "Compose model uses prebuilt images (tags). Skipping local build."
+    return 0
+  fi
+  log "No images found in config and FORCE_BUILD=false. Ensuring tags are set to 'latest' then pulling."
+  safe_kv_set ".env" "CORE_TAG" "${CORE_TAG:-latest}"
+  safe_kv_set ".env" "MODULES_TAG" "${MODULES_TAG:-latest}"
 }
 
 compose_up() {
@@ -292,11 +409,12 @@ compose_up() {
 }
 
 wait_for_http() {
-  local url="${1:-https://0.0.0.0}"
+  local base="${1:-http://127.0.0.1}"
+  local url="${base%/}/users/login"
   local deadline=$(( $(date +%s) + WAIT_TIMEOUT ))
-  log "Waiting for MISP to respond at $url with timeout ${WAIT_TIMEOUT}s"
+  log "Waiting for MISP to respond at $url (timeout ${WAIT_TIMEOUT}s)"
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if curl -k -s -o /dev/null -w "%{http_code}" "$url" | grep -qE '^(200|302|401|403)$'; then
+    if curl -L -k -s -o /dev/null -w "%{http_code}" "$url" | grep -qE '^(200|302|401|403)$'; then
       log "MISP endpoint is responding"
       return 0
     fi
@@ -304,6 +422,7 @@ wait_for_http() {
   done
   fail "Timed out waiting for $url"
 }
+
 
 rendered_services_debug() {
   if [ "$DEBUG" = "1" ]; then
@@ -342,17 +461,23 @@ ensure_misp_modules_running() {
   else
     log "misp-modules container running: $cid"
   fi
-  docker exec -i "$cid" bash -lc "curl -sSf http://127.0.0.1:6666/modules | head -c 200 >/dev/null" \
+
+  docker exec -i "$cid" bash -lc "command -v curl >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y curl)" >/dev/null 2>&1 || true
+  docker exec -i "$cid" bash -lc "curl -fsS http://127.0.0.1:6666/modules >/dev/null" \
     && log "misp-modules endpoint reachable internally" \
     || log "misp-modules HTTP check not successful yet"
+
   echo "$cid"
 }
+
 
 install_ai_module_into_misp_modules() {
   local cid="$1"
   log "Installing AI expansion into misp-modules container $cid"
   docker exec -i "$cid" bash -lc "
     set -euo pipefail
+
+    # deps + clone/update
     command -v git >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates)
     mkdir -p '$AI_WORKDIR'
     if [ -d '$AI_WORKDIR/.git' ]; then
@@ -360,6 +485,8 @@ install_ai_module_into_misp_modules() {
     else
       git clone --depth 1 '$AI_REPO_URL' '$AI_WORKDIR'
     fi
+
+    # python reqs
     if command -v pip3 >/dev/null 2>&1; then
       pip3 install -r '$AI_WORKDIR/$AI_REQS_REL'
     elif command -v pip >/dev/null 2>&1; then
@@ -368,45 +495,87 @@ install_ai_module_into_misp_modules() {
       apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
       pip3 install -r '$AI_WORKDIR/$AI_REQS_REL'
     fi
-    py_site=\$(python3 -c 'import site; print([p for p in site.getsitepackages() if "site-packages" in p][0])')
+
+    # where misp_modules lives
+    py_site=\$(python3 -c 'import site; print([p for p in site.getsitepackages() if \"site-packages\" in p][0])')
     mod_dst=\"\$py_site/misp_modules/modules/expansion\"
     mkdir -p \"\$mod_dst\"
-    cp '$AI_MODULE_REL' \"\$mod_dst/\"
+
+    # copy the module (resolve relative to \$AI_WORKDIR)
+    cd '$AI_WORKDIR'
+    if [ ! -f '$AI_MODULE_REL' ]; then
+      echo \"ERROR: AI module not found at \$PWD/$AI_MODULE_REL\" >&2
+      echo \"Available candidates:\" >&2
+      (set -x; find . -maxdepth 3 -name 'ai_event_analysis.py' -print || true) >&2
+      exit 1
+    fi
+
+    install -m 0644 '$AI_MODULE_REL' \"\$mod_dst/\"
     echo \"Installed ai_event_analysis.py to \$mod_dst\"
   " | tee -a "$LOG_FILE"
 
-  log "Restarting misp-modules to load the new module"
-  docker restart "$cid" | tee -a "$LOG_FILE"
+  # quiet restart so misp-modules picks it up
+  docker restart "$cid" >/dev/null 2>&1 || log "Warn: docker restart of misp-modules returned non-zero"
 }
+
 
 enable_modules_in_misp_app() {
   local app_cid="$1"
-  log "Enabling Enrichment, Import, Export modules in MISP app"
+  log "Enabling modules and forcing base URLs to ${MISP_FORCED_BASEURL}"
   local cake="/var/www/MISP/app/Console/cake"
+
   docker exec -i "$app_cid" bash -lc "
     set -euo pipefail
     if [ ! -x '$cake' ]; then echo 'Cake not found at $cake' >&2; exit 1; fi
+
+    # helper: set a setting only if it exists for this MISP build
+    set_if_exists() {
+      local key=\"\$1\" val=\"\$2\"
+      if sudo -u www-data $cake Admin getSetting \"\$key\" >/dev/null 2>&1; then
+        sudo -u www-data $cake Admin setSetting \"\$key\" \"\$val\"
+      else
+        echo \"Skipping non-existent setting \$key\" >&2
+      fi
+    }
+
+    # core URLs
+    sudo -u www-data $cake Admin setSetting 'MISP.baseurl' '${MISP_FORCED_BASEURL}'
+    sudo -u www-data $cake Admin setSetting 'MISP.external_baseurl' '${MISP_FORCED_BASEURL}'
+    sudo -u www-data $cake Admin setSetting 'Security.rest_client_baseurl' '${MISP_FORCED_BASEURL}'
+
+    # do not force HTTPS inside app (TLS handled by Caddy if enabled)
+    set_if_exists 'Security.force_https' 0
+    # intentionally no 'Security.strict_https' — not present in many builds
+
+    # enable misp-modules + URLs
     sudo -u www-data $cake Admin setSetting 'Plugin.Enrichment_services_enable' true
     sudo -u www-data $cake Admin setSetting 'Plugin.Import_services_enable' true
     sudo -u www-data $cake Admin setSetting 'Plugin.Export_services_enable' true
     sudo -u www-data $cake Admin setSetting 'Plugin.Enrichment_services_url' 'http://misp-modules:6666'
     sudo -u www-data $cake Admin setSetting 'Plugin.Import_services_url' 'http://misp-modules:6666'
     sudo -u www-data $cake Admin setSetting 'Plugin.Export_services_url' 'http://misp-modules:6666'
-    sudo -u www-data $cake Admin setSetting 'Plugin.Enrichment_services_timeout' 120
-    sudo -u www-data $cake Admin setSetting 'Plugin.Import_services_timeout' 120
-    sudo -u www-data $cake Admin setSetting 'Plugin.Export_services_timeout' 120
+
+    # no timeout keys here (they differ across versions)
+
     sudo -u www-data $cake Admin runUpdates
   " | tee -a "$LOG_FILE"
 }
 
+
+
 ensure_ufw() {
   if ! command -v ufw >/dev/null 2>&1; then install_pkg ufw; fi
   sudo ufw allow 22/tcp || true
-  sudo ufw allow 80/tcp || true
-  sudo ufw allow 443/tcp || true
+  if [ "${HARDEN_TLS:-false}" = "true" ]; then
+    sudo ufw allow 80/tcp || true
+    sudo ufw allow 443/tcp || true
+  else
+    sudo ufw allow ${HOST_HTTP_PORT}/tcp || true
+  fi
   echo "y" | sudo ufw enable || true
   sudo ufw status verbose | tee -a "$LOG_FILE"
 }
+
 
 tls_proxy_setup() {
   [ "$HARDEN_TLS" = "true" ] || return 0
@@ -453,7 +622,7 @@ print_access_info() {
   if [ "$HARDEN_TLS" = "true" ] && [ -n "$PUBLIC_DOMAIN" ]; then
     log "Public URL: https://${PUBLIC_DOMAIN}"
   else
-    log "Local URL: https://0.0.0.0"
+    log "Local URL: $MISP_FORCED_BASEURL"
   fi
   if [ -f "../misp_secure_credentials.txt" ]; then
     log "Generated credentials saved to misp_secure_credentials.txt. Change them as needed."
@@ -548,7 +717,7 @@ Usage:
   ACTION=destroy $0        Destroy dev instance, remove containers, volumes, generated files
 
 Common run modes:
-  1) Default dev
+  1) Default dev (pull prebuilt images)
      ./misp_dev_builder_installer_hardened.sh
 
   2) With DEBUG trace
@@ -566,7 +735,7 @@ Common run modes:
   6) Auto clone inside app container path
      AUTO_CLONE_INSIDE_APP=true INSIDE_APP_CLONE_DIR=/opt/misp-ai-expansion ./misp_dev_builder_installer_hardened.sh
 
-  7) Custom repo checkout location and longer wait
+  7) Custom checkout & longer wait
      TARGET_DIR=/opt/misp-docker WAIT_TIMEOUT=600 ./misp_dev_builder_installer_hardened.sh
 
   8) Destroy dev instance
@@ -576,8 +745,8 @@ Common run modes:
      ACTION=destroy DOCKER_UNINSTALL=true ./misp_dev_builder_installer_hardened.sh
 
 Notes:
-  The script sets CORE_COMMIT and MODULES_COMMIT to master by default to satisfy misp-docker build logic.
-  If the compose model lacks images, it will run a one time local build for misp-core and misp-modules.
+  - The script auto-selects an HTTP port (80 if free, else 8081-8099), exposes it on misp-core,
+    and sets MISP.baseurl to http://127.0.0.1[:port] so redirects won't point to https://localhost.
 USAGE
 }
 
@@ -595,22 +764,36 @@ main() {
   check_prereqs
   check_github_connectivity
   clone_repo
+
+  # choose host port & URL before writing env/override
+  choose_host_port
+  compute_baseurl
+
   log "Starting prepare_env"
   prepare_env
-  log "Applying baseline hardening and override"
-  if [ "$HARDEN_BASELINE" = "true" ]; then baseline_hardening_env; write_compose_override; fi
+  log "Applying baseline hardening and writing override"
+  if [ "$HARDEN_BASELINE" = "true" ]; then baseline_hardening_env; fi
+  write_compose_override
+
   log "Bringing up docker compose"
   compose_up
   rendered_services_debug
-  log "Waiting for HTTPS endpoint"
-  wait_for_http "https://0.0.0.0"
+
+  log "Waiting for HTTP endpoint"
+  wait_for_http "$MISP_FORCED_BASEURL"
 
   if [ "$HARDEN_TLS" = "true" ]; then tls_proxy_setup; fi
   if [ "$HARDEN_UFW" = "true" ]; then ensure_ufw; fi
 
   log "Ensuring misp-modules running"
   local modules_cid app_cid
-  modules_cid="$(ensure_misp_modules_running)"
+  modules_cid="$(find_misp_modules_container)"
+  if [ -z "$modules_cid" ]; then
+    modules_cid="$(ensure_misp_modules_running)"
+  else
+    log "misp-modules container running: $modules_cid"
+  fi
+
   app_cid="$(find_misp_app_container)"; [ -n "$app_cid" ] || fail "MISP app container not found"
 
   log "Installing AI module and enabling plugins"
