@@ -187,6 +187,7 @@ ensure_env_defaults_for_master() {
   grep -q '^MODULES_COMMIT=' "$envf" || echo "MODULES_COMMIT=master" >> "$envf"
   grep -q '^DISABLE_SSL_REDIRECT=' "$envf" || echo "DISABLE_SSL_REDIRECT=true" >> "$envf"
   grep -q '^DISABLE_CA_REFRESH='  "$envf" || echo "DISABLE_CA_REFRESH=true"  >> "$envf"
+  grep -q '^MISP_BASEURL=' "$envf" || echo "MISP_BASEURL=https://0.0.0.0" >> "$envf"
 }
 
 prepare_env() {
@@ -223,7 +224,7 @@ baseline_hardening_env() {
   if [ -n "$PUBLIC_DOMAIN" ]; then
     safe_kv_set "$envf" "MISP_BASEURL" "https://${PUBLIC_DOMAIN}"
   else
-    safe_kv_set "$envf" "MISP_BASEURL" "https://localhost"
+    safe_kv_set "$envf" "MISP_BASEURL" "https://0.0.0.0"
   fi
 
   umask 077
@@ -251,7 +252,7 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
-  misp:
+  misp-core:
     depends_on:
       - misp-modules
     logging:
@@ -268,18 +269,18 @@ YAML
 config_has_images() {
   local cfg
   cfg="$($COMPOSE_BIN config 2>/dev/null || true)"
-  echo "$cfg" | awk '/services:/,/^$/' | grep -A6 'misp:' | grep -q 'image:' && \
+  echo "$cfg" | awk '/services:/,/^$/' | grep -A6 'misp-core:' | grep -q 'image:' && \
   echo "$cfg" | awk '/services:/,/^$/' | grep -A6 'misp-modules:' | grep -q 'image:'
 }
 
 # Build locally if image entries are not present
 maybe_build_images() {
   if config_has_images; then
-    log "Compose model contains images for misp and misp-modules. No build needed."
+    log "Compose model contains images for misp-core and misp-modules. No build needed."
     return 0
   fi
-  log "Compose model lacks image entries. Performing one-time local build for misp and misp-modules."
-  $COMPOSE_BIN build misp misp-modules | tee -a "$LOG_FILE"
+  log "Compose model lacks image entries. Performing one-time local build for misp-core and misp-modules."
+  $COMPOSE_BIN build misp-core misp-modules | tee -a "$LOG_FILE"
 }
 
 compose_up() {
@@ -291,7 +292,7 @@ compose_up() {
 }
 
 wait_for_http() {
-  local url="${1:-https://localhost}"
+  local url="${1:-https://0.0.0.0}"
   local deadline=$(( $(date +%s) + WAIT_TIMEOUT ))
   log "Waiting for MISP to respond at $url with timeout ${WAIT_TIMEOUT}s"
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -304,21 +305,28 @@ wait_for_http() {
   fail "Timed out waiting for $url"
 }
 
+rendered_services_debug() {
+  if [ "$DEBUG" = "1" ]; then
+    log "Rendered compose services:"
+    $COMPOSE_BIN config --services || true
+  fi
+}
+
 find_container_by_service() {
   local svc="$1"
   docker ps --filter "label=com.docker.compose.service=${svc}" --format '{{.ID}}' | head -n1
 }
 find_misp_app_container() {
-  local cid; cid="$(find_container_by_service misp)"
+  local cid; cid="$(find_container_by_service misp-core)"
   if [ -z "$cid" ]; then
-    cid="$(docker ps --format '{{.ID}} {{.Names}}' | awk '/misp/ && !/proxy/ {print $1}' | head -n1)"
+    cid="$(docker ps --format '{{.ID}} {{.Names}}' | awk '/misp-core/ {print $1}' | head -n1)"
   fi
   echo "$cid"
 }
 find_misp_modules_container() {
   local cid; cid="$(find_container_by_service misp-modules)"
   if [ -z "$cid" ]; then
-    cid="$(docker ps --format '{{.ID}} {{.Names}}' | awk '/modules/ && /misp/ {print $1}' | head -n1)"
+    cid="$(docker ps --format '{{.ID}} {{.Names}}' | awk '/misp-modules/ {print $1}' | head -n1)"
   fi
   echo "$cid"
 }
@@ -414,7 +422,7 @@ tls_proxy_setup() {
 }
 ${PUBLIC_DOMAIN} {
   encode zstd gzip
-  reverse_proxy misp:443 {
+  reverse_proxy misp-core:443 {
     transport http {
       tls_insecure_skip_verify
     }
@@ -432,7 +440,7 @@ services:
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
     depends_on:
-      - misp
+      - misp-core
     networks:
       - default
 YAML
@@ -445,7 +453,7 @@ print_access_info() {
   if [ "$HARDEN_TLS" = "true" ] && [ -n "$PUBLIC_DOMAIN" ]; then
     log "Public URL: https://${PUBLIC_DOMAIN}"
   else
-    log "Local URL: https://localhost"
+    log "Local URL: https://0.0.0.0"
   fi
   if [ -f "../misp_secure_credentials.txt" ]; then
     log "Generated credentials saved to misp_secure_credentials.txt. Change them as needed."
@@ -569,7 +577,7 @@ Common run modes:
 
 Notes:
   The script sets CORE_COMMIT and MODULES_COMMIT to master by default to satisfy misp-docker build logic.
-  If the compose model lacks images, it will run a one time local build for misp and misp-modules.
+  If the compose model lacks images, it will run a one time local build for misp-core and misp-modules.
 USAGE
 }
 
@@ -593,8 +601,9 @@ main() {
   if [ "$HARDEN_BASELINE" = "true" ]; then baseline_hardening_env; write_compose_override; fi
   log "Bringing up docker compose"
   compose_up
+  rendered_services_debug
   log "Waiting for HTTPS endpoint"
-  wait_for_http "https://localhost"
+  wait_for_http "https://0.0.0.0"
 
   if [ "$HARDEN_TLS" = "true" ]; then tls_proxy_setup; fi
   if [ "$HARDEN_UFW" = "true" ]; then ensure_ufw; fi
