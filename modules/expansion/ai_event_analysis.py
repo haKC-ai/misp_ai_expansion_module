@@ -36,7 +36,7 @@ except Exception:
 
 load_dotenv()
 
-MODULE_VERSION = "1.0.1"
+MODULE_VERSION = "1.0.0"
 
 logger = logging.getLogger("misp_ai_event_analysis")
 logger.setLevel(logging.INFO)
@@ -65,7 +65,7 @@ mispattributes = {
     },
     "format": "misp_standard",
     "input": ["misp_event", "misp_events"],
-    "output": "misp_standard"
+    "output": ["misp_standard"]
 }
 
 moduleinfo = {
@@ -97,9 +97,8 @@ def _redact(s: str) -> str:
 def introspection() -> Dict[str, Any]:
     return mispattributes
 
-def version():
-    """Return module metadata dict (expected by misp-modules)."""
-    return moduleinfo
+def version() -> str:
+    return MODULE_VERSION
 
 def _read_provider(cfg: Dict[str, Any]) -> str:
     p = cfg.get("AI_PROVIDER") or os.getenv("AI_PROVIDER", "openai")
@@ -183,6 +182,7 @@ def _build_ai_prompt(dataset: List[Dict[str, Any]]) -> str:
     ]
     payload = {"policy": rules, "dataset": dataset}
     return json.dumps(payload, separators=(",", ":"))
+
 
 def _call_openai(prompt: str, model: str, timeout_s: int) -> str:
     client = OpenAIClient(api_key=os.getenv("OPENAI_API_KEY"))
@@ -331,14 +331,8 @@ def _push_results_to_new_event(misp: ExpandedPyMISP, parsed: Dict[str, Any], sou
 
     return {"created_event_uuid": new["Event"]["uuid"], "event_id": new["Event"]["id"]}
 
-def handler(q) -> Dict[str, Any]:
+def handler(q: Dict[str, Any]) -> Dict[str, Any]:
     try:
-        # Accept dict or JSON string payloads
-        if isinstance(q, str):
-            q = json.loads(q) if q.strip() else {}
-        elif q is None:
-            q = {}
-
         cfg = q.get("config", {}) or {}
         provider = _read_provider(cfg)
         timeout_s = int(os.getenv("LLM_TIMEOUT_SECONDS", "90"))
@@ -363,12 +357,7 @@ def handler(q) -> Dict[str, Any]:
         prompt = _build_ai_prompt(dataset)
         logger.info(f"Provider={provider}")
 
-        try:
-            raw = _run_llm(provider, prompt, cfg, timeout_s)
-        except Exception as llm_err:
-            logger.error(f"LLM call failed: {llm_err}")
-            return {"error": f"LLM call failed: {llm_err}"}
-
+        raw = _run_llm(provider, prompt, cfg, timeout_s)
         cleaned = _clean_json_block(raw)
         parsed = json.loads(cleaned)
 
