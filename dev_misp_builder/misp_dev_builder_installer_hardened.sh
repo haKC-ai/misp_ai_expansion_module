@@ -7,7 +7,7 @@ set -euo pipefail
 LOG_FILE="${LOG_FILE:-$(pwd)/misp_dev_environment.log}"
 REPO_URL="${REPO_URL:-https://github.com/MISP/misp-docker}"
 TARGET_DIR="${TARGET_DIR:-misp-docker}"
-GIT_BRANCH="${GIT_BRANCH:-main}"
+GIT_BRANCH="${GIT_BRANCH:-master}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-300}"
 SLEEP_SECS="${SLEEP_SECS:-5}"
 COMPOSE_BIN=""
@@ -32,8 +32,8 @@ AUTO_ATTACH_APP_SHELL="${AUTO_ATTACH_APP_SHELL:-true}"
 INSIDE_APP_CLONE_DIR="${INSIDE_APP_CLONE_DIR:-/opt/misp-ai-expansion}"
 
 # Destroy behavior
-DOCKER_UNINSTALL="${DOCKER_UNINSTALL:-false}"   # set true to remove docker packages if this script installed them
-NONINTERACTIVE="${NONINTERACTIVE:-false}"       # set true to skip interactive confirmations
+DOCKER_UNINSTALL="${DOCKER_UNINSTALL:-false}"   # remove Docker only if this script installed it
+NONINTERACTIVE="${NONINTERACTIVE:-false}"       # skip confirmations in destroy mode
 
 DEBUG="${DEBUG:-0}"
 
@@ -48,7 +48,7 @@ debug_off() { [ "$DEBUG" = "1" ] && set +x || true; }
 record_state() {
   local k="$1" v="$2"
   mkdir -p "$(dirname "$STATE_FILE")"
-  grep -v -E "^${k}=" "$STATE_FILE" 2>/dev/null || true > "${STATE_FILE}.tmp" || true
+  : > "${STATE_FILE}.tmp"
   if [ -f "$STATE_FILE" ]; then
     grep -v -E "^${k}=" "$STATE_FILE" >> "${STATE_FILE}.tmp" || true
   fi
@@ -139,7 +139,7 @@ check_prereqs() {
 check_github_connectivity() {
   log "Preflight: checking connectivity to github.com"
   if ! getent hosts github.com >/dev/null 2>&1; then
-    fail "DNS cannot resolve github.com. Fix DNS or add a proxy."
+    fail "DNS cannot resolve github.com. Fix DNS or set a proxy."
   fi
   if ! curl -I -sS https://github.com | head -n1 | grep -q "HTTP/"; then
     fail "Cannot reach https://github.com. Check firewall or proxy."
@@ -180,6 +180,15 @@ clone_repo() {
   log "Clone OK"
 }
 
+# Ensure env defaults required by misp-docker on master branch
+ensure_env_defaults_for_master() {
+  local envf=".env"
+  grep -q '^CORE_COMMIT=' "$envf" || echo "CORE_COMMIT=master" >> "$envf"
+  grep -q '^MODULES_COMMIT=' "$envf" || echo "MODULES_COMMIT=master" >> "$envf"
+  grep -q '^DISABLE_SSL_REDIRECT=' "$envf" || echo "DISABLE_SSL_REDIRECT=true" >> "$envf"
+  grep -q '^DISABLE_CA_REFRESH='  "$envf" || echo "DISABLE_CA_REFRESH=true"  >> "$envf"
+}
+
 prepare_env() {
   cd "$TARGET_DIR"
   if [ ! -f "template.env" ]; then fail "template.env not found in $(pwd)"; fi
@@ -190,6 +199,7 @@ prepare_env() {
   else
     log ".env already exists. Leaving as is."
   fi
+  ensure_env_defaults_for_master
 }
 
 baseline_hardening_env() {
@@ -254,9 +264,28 @@ YAML
   log "Wrote docker-compose.override.yml"
 }
 
+# Inspect rendered compose to see if images are defined
+config_has_images() {
+  local cfg
+  cfg="$($COMPOSE_BIN config 2>/dev/null || true)"
+  echo "$cfg" | awk '/services:/,/^$/' | grep -A6 'misp:' | grep -q 'image:' && \
+  echo "$cfg" | awk '/services:/,/^$/' | grep -A6 'misp-modules:' | grep -q 'image:'
+}
+
+# Build locally if image entries are not present
+maybe_build_images() {
+  if config_has_images; then
+    log "Compose model contains images for misp and misp-modules. No build needed."
+    return 0
+  fi
+  log "Compose model lacks image entries. Performing one-time local build for misp and misp-modules."
+  $COMPOSE_BIN build misp misp-modules | tee -a "$LOG_FILE"
+}
+
 compose_up() {
   log "Pulling images"
-  $COMPOSE_BIN pull | tee -a "$LOG_FILE"
+  $COMPOSE_BIN pull | tee -a "$LOG_FILE" || true
+  maybe_build_images
   log "Starting containers detached"
   $COMPOSE_BIN up -d | tee -a "$LOG_FILE"
 }
@@ -459,38 +488,32 @@ maybe_clone_into_app_and_attach() {
 destroy_all() {
   log "Destroy requested"
 
-  # Compose down with volumes for main stack
   if [ -d "$TARGET_DIR" ]; then
     pushd "$TARGET_DIR" >/dev/null
     if [ -f docker-compose.yml ]; then
-      log "Bringing down docker compose stack with volumes"
+      log "Compose down with volumes"
       $COMPOSE_BIN down -v --remove-orphans | tee -a "$LOG_FILE" || true
     fi
-    # Caddy stack if present
     if [ -f caddy/docker-compose.caddy.yml ]; then
-      log "Bringing down Caddy proxy stack"
+      log "Caddy down with volumes"
       $COMPOSE_BIN -f docker-compose.yml -f caddy/docker-compose.caddy.yml down -v --remove-orphans | tee -a "$LOG_FILE" || true
     fi
     popd >/dev/null
 
-    # Remove cloned repo if we created it
     if [ "$(read_state created_env || echo 0)" = "1" ] || [ ! -d "$TARGET_DIR/.git" ]; then
       log "Removing ${TARGET_DIR} directory"
       rm -rf "$TARGET_DIR"
     fi
   fi
 
-  # Delete generated files
   log "Removing generated files"
   rm -f misp_secure_credentials.txt .misp_dev_state "$LOG_FILE" 2>/dev/null || true
 
-  # Try to remove any stray containers by label
-  log "Pruning stray containers, networks, and volumes (safe prune)"
+  log "Pruning stray containers, networks, and volumes"
   docker container prune -f >/dev/null 2>&1 || true
   docker network prune -f >/dev/null 2>&1 || true
   docker volume prune -f >/dev/null 2>&1 || true
 
-  # Optional docker uninstall only if we installed it
   if [ "$(read_state installed_docker || echo 0)" = "1" ] && [ "$DOCKER_UNINSTALL" = "true" ]; then
     if prompt_yes "Uninstall Docker CE and related packages installed by this script"; then
       log "Uninstalling Docker CE"
@@ -508,18 +531,45 @@ destroy_all() {
 }
 
 # =========================================
-# Main
+# Usage and Main
 # =========================================
 usage() {
   cat <<USAGE
 Usage:
-  $0                Build and configure MISP dev instance
-  ACTION=destroy $0 Destroy dev instance, remove containers, volumes, generated files
-Env knobs:
-  DEBUG=1, HARDEN_BASELINE=true, HARDEN_TLS=false, PUBLIC_DOMAIN=, ACME_EMAIL=, HARDEN_UFW=false
-  AUTO_CLONE_INSIDE_APP=true, AUTO_ATTACH_APP_SHELL=true
-  DOCKER_UNINSTALL=false (only if the script installed Docker)
-  NONINTERACTIVE=false
+  $0                       Build and configure MISP dev instance, then drop into app shell
+  ACTION=destroy $0        Destroy dev instance, remove containers, volumes, generated files
+
+Common run modes:
+  1) Default dev
+     ./misp_dev_builder_installer_hardened.sh
+
+  2) With DEBUG trace
+     DEBUG=1 ./misp_dev_builder_installer_hardened.sh
+
+  3) With TLS via Caddy
+     HARDEN_TLS=true PUBLIC_DOMAIN=misp.example.org ACME_EMAIL=ops@example.org ./misp_dev_builder_installer_hardened.sh
+
+  4) With UFW baseline
+     HARDEN_UFW=true ./misp_dev_builder_installer_hardened.sh
+
+  5) Skip auto attach, clone manually later
+     AUTO_ATTACH_APP_SHELL=false ./misp_dev_builder_installer_hardened.sh
+
+  6) Auto clone inside app container path
+     AUTO_CLONE_INSIDE_APP=true INSIDE_APP_CLONE_DIR=/opt/misp-ai-expansion ./misp_dev_builder_installer_hardened.sh
+
+  7) Custom repo checkout location and longer wait
+     TARGET_DIR=/opt/misp-docker WAIT_TIMEOUT=600 ./misp_dev_builder_installer_hardened.sh
+
+  8) Destroy dev instance
+     ACTION=destroy ./misp_dev_builder_installer_hardened.sh
+
+  9) Destroy and uninstall Docker that this script installed
+     ACTION=destroy DOCKER_UNINSTALL=true ./misp_dev_builder_installer_hardened.sh
+
+Notes:
+  The script sets CORE_COMMIT and MODULES_COMMIT to master by default to satisfy misp-docker build logic.
+  If the compose model lacks images, it will run a one time local build for misp and misp-modules.
 USAGE
 }
 
