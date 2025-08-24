@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =========================================
+# Config and defaults
+# =========================================
 LOG_FILE="${LOG_FILE:-$(pwd)/misp_dev_environment.log}"
 REPO_URL="${REPO_URL:-https://github.com/MISP/misp-docker}"
 TARGET_DIR="${TARGET_DIR:-misp-docker}"
@@ -8,25 +11,69 @@ GIT_BRANCH="${GIT_BRANCH:-main}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-300}"
 SLEEP_SECS="${SLEEP_SECS:-5}"
 COMPOSE_BIN=""
+STATE_FILE="${STATE_FILE:-$(pwd)/.misp_dev_state}"
 
+# Hardening knobs
 HARDEN_BASELINE="${HARDEN_BASELINE:-true}"
 HARDEN_TLS="${HARDEN_TLS:-false}"
 PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-}"
 ACME_EMAIL="${ACME_EMAIL:-}"
 HARDEN_UFW="${HARDEN_UFW:-false}"
 
+# AI module knobs
 AI_REPO_URL="${AI_REPO_URL:-https://github.com/haKC-ai/misp_ai_expansion_module}"
 AI_WORKDIR="${AI_WORKDIR:-/opt/misp-ai-expansion}"
 AI_MODULE_REL="${AI_MODULE_REL:-modules/expansion/ai_event_analysis.py}"
 AI_REQS_REL="${AI_REQS_REL:-requirements.txt}"
 
-AUTO_CLONE_INSIDE_APP="${AUTO_CLONE_INSIDE_APP:-true}"     # leave false so you can clone manually inside the shell
-AUTO_ATTACH_APP_SHELL="${AUTO_ATTACH_APP_SHELL:-true}"      # force shell attach by default
+# Attach behavior
+AUTO_CLONE_INSIDE_APP="${AUTO_CLONE_INSIDE_APP:-true}"
+AUTO_ATTACH_APP_SHELL="${AUTO_ATTACH_APP_SHELL:-true}"
 INSIDE_APP_CLONE_DIR="${INSIDE_APP_CLONE_DIR:-/opt/misp-ai-expansion}"
 
+# Destroy behavior
+DOCKER_UNINSTALL="${DOCKER_UNINSTALL:-false}"   # set true to remove docker packages if this script installed them
+NONINTERACTIVE="${NONINTERACTIVE:-false}"       # set true to skip interactive confirmations
+
+DEBUG="${DEBUG:-0}"
+
+# =========================================
+# Helpers
+# =========================================
 log() { printf "%s %s\n" "$(date +'%Y-%m-%dT%H:%M:%S%z')" "$*" | tee -a "$LOG_FILE"; }
 fail() { log "ERROR: $*"; exit 1; }
-trap 'fail "Unexpected error. See $LOG_FILE for details."' ERR
+debug_on()  { [ "$DEBUG" = "1" ] && set -x || true; }
+debug_off() { [ "$DEBUG" = "1" ] && set +x || true; }
+
+record_state() {
+  local k="$1" v="$2"
+  mkdir -p "$(dirname "$STATE_FILE")"
+  grep -v -E "^${k}=" "$STATE_FILE" 2>/dev/null || true > "${STATE_FILE}.tmp" || true
+  if [ -f "$STATE_FILE" ]; then
+    grep -v -E "^${k}=" "$STATE_FILE" >> "${STATE_FILE}.tmp" || true
+  fi
+  echo "${k}=${v}" >> "${STATE_FILE}.tmp"
+  mv "${STATE_FILE}.tmp" "$STATE_FILE"
+}
+
+read_state() {
+  local k="$1"
+  if [ -f "$STATE_FILE" ]; then
+    awk -F= -v key="$k" '$1==key{print $2}' "$STATE_FILE" | tail -n1
+  fi
+}
+
+prompt_yes() {
+  local msg="$1"
+  if [ "$NONINTERACTIVE" = "true" ]; then
+    return 0
+  fi
+  read -r -p "$msg [y/N]: " ans
+  case "$ans" in
+    y|Y|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 install_pkg() {
   local pkg="$1"
@@ -36,8 +83,12 @@ install_pkg() {
 }
 
 detect_compose() {
-  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then COMPOSE_BIN="docker compose"; return; fi
-  if command -v docker-compose >/dev/null 2>&1; then COMPOSE_BIN="docker-compose"; return; fi
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    COMPOSE_BIN="docker compose"; return
+  fi
+  if command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_BIN="docker-compose"; return
+  fi
   fail "Docker Compose not found"
 }
 
@@ -46,23 +97,17 @@ rand_hex() { openssl rand -hex 32 | tr -d '\n'; }
 
 safe_kv_set() {
   local file="$1" key="$2" value="$3"
-  if grep -qE "^${key}=" "$file"; then sed -i "s|^${key}=.*|${key}=${value}|" "$file"; else echo "${key}=${value}" >> "$file"; fi
-}
-
-ensure_ufw() {
-  if ! command -v ufw >/dev/null 2>&1; then install_pkg ufw; fi
-  sudo ufw allow 22/tcp || true
-  sudo ufw allow 80/tcp || true
-  sudo ufw allow 443/tcp || true
-  echo "y" | sudo ufw enable || true
-  sudo ufw status verbose | tee -a "$LOG_FILE"
+  if grep -qE "^${key}=" "$file"; then
+    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+  else
+    echo "${key}=${value}" >> "$file"
+  fi
 }
 
 make_helpers_executable() {
   log "Marking helper scripts executable"
   find "$(pwd)" -maxdepth 2 -type f \( -name "*.sh" -o -name "installer.sh" \) -print0 | xargs -0 -I{} bash -c 'chmod +x "{}" || true'
   [ -d "./dev_misp_builder" ] && find ./dev_misp_builder -type f -name "*.sh" -print0 | xargs -0 chmod +x || true
-  [ -f "./installer.sh" ] && chmod +x ./installer.sh || true
 }
 
 check_prereqs() {
@@ -82,28 +127,69 @@ check_prereqs() {
     sudo apt-get update -qq
     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     sudo usermod -aG docker "$USER" || true
+    record_state installed_docker "1"
     log "Docker installed"
+  else
+    log "Docker already present"
   fi
   detect_compose
   log "Using compose driver: $COMPOSE_BIN"
 }
 
+check_github_connectivity() {
+  log "Preflight: checking connectivity to github.com"
+  if ! getent hosts github.com >/dev/null 2>&1; then
+    fail "DNS cannot resolve github.com. Fix DNS or add a proxy."
+  fi
+  if ! curl -I -sS https://github.com | head -n1 | grep -q "HTTP/"; then
+    fail "Cannot reach https://github.com. Check firewall or proxy."
+  fi
+  log "Connectivity OK"
+}
+
 clone_repo() {
+  log "Preparing to clone ${REPO_URL} into ${TARGET_DIR} (branch ${GIT_BRANCH})"
+  if [ -d "$TARGET_DIR" ] && [ ! -d "$TARGET_DIR/.git" ]; then
+    log "Found partial directory ${TARGET_DIR} without .git. Removing it."
+    rm -rf "$TARGET_DIR"
+  fi
+
   if [ -d "$TARGET_DIR/.git" ]; then
     log "Repo exists: $TARGET_DIR. Updating branch $GIT_BRANCH"
-    git -C "$TARGET_DIR" fetch --all --prune >>"$LOG_FILE" 2>&1 || true
-    git -C "$TARGET_DIR" checkout "$GIT_BRANCH" >>"$LOG_FILE" 2>&1 || true
-    git -C "$TARGET_DIR" pull --ff-only >>"$LOG_FILE" 2>&1 || true
+    debug_on
+    git -C "$TARGET_DIR" fetch --all --prune 2>&1 | tee -a "$LOG_FILE" || fail "git fetch failed"
+    git -C "$TARGET_DIR" checkout "$GIT_BRANCH" 2>&1 | tee -a "$LOG_FILE" || fail "git checkout failed"
+    git -C "$TARGET_DIR" pull --ff-only 2>&1 | tee -a "$LOG_FILE" || fail "git pull failed"
+    debug_off
   else
-    log "Cloning $REPO_URL into $TARGET_DIR (branch $GIT_BRANCH)"
-    git clone --branch "$GIT_BRANCH" --depth 1 "$REPO_URL" "$TARGET_DIR" >>"$LOG_FILE" 2>&1
+    log "Cloning fresh copy"
+    debug_on
+    local tries=3 ok=0
+    for i in $(seq 1 $tries); do
+      log "git clone attempt ${i}/${tries}"
+      if git clone --progress --branch "$GIT_BRANCH" --depth 1 "$REPO_URL" "$TARGET_DIR" 2>&1 | tee -a "$LOG_FILE"; then
+        ok=1; break
+      fi
+      sleep 3
+    done
+    debug_off
+    [ "$ok" = "1" ] || { tail -n 80 "$LOG_FILE" >&2; fail "git clone failed after ${tries} attempts"; }
   fi
+
+  [ -f "$TARGET_DIR/template.env" ] || fail "template.env not found after clone. Upstream layout changed or clone incomplete."
+  log "Clone OK"
 }
 
 prepare_env() {
   cd "$TARGET_DIR"
   if [ ! -f "template.env" ]; then fail "template.env not found in $(pwd)"; fi
-  if [ ! -f ".env" ]; then log "Creating .env from template.env"; cp template.env .env; else log ".env already exists. Leaving as is."; fi
+  if [ ! -f ".env" ]; then
+    log "Creating .env from template.env"
+    cp template.env .env
+    record_state created_env "1"
+  else
+    log ".env already exists. Leaving as is."
+  fi
 }
 
 baseline_hardening_env() {
@@ -116,13 +202,20 @@ baseline_hardening_env() {
   local mysql_pw="$(rand_hex)"
   local redis_pw="$(rand_hex)"
   local salt="$(rand_hex)"
+
   safe_kv_set "$envf" "MISP_ADMIN_EMAIL" "$admin_email"
   safe_kv_set "$envf" "MISP_ADMIN_PASSPHRASE" "$admin_pass"
   safe_kv_set "$envf" "MYSQL_ROOT_PASSWORD" "$mysql_root"
   safe_kv_set "$envf" "MYSQL_PASSWORD" "$mysql_pw"
   safe_kv_set "$envf" "REDIS_PASSWORD" "$redis_pw"
   safe_kv_set "$envf" "MISP_SALT" "$salt"
-  if [ -n "$PUBLIC_DOMAIN" ]; then safe_kv_set "$envf" "MISP_BASEURL" "https://${PUBLIC_DOMAIN}"; else safe_kv_set "$envf" "MISP_BASEURL" "https://localhost"; fi
+
+  if [ -n "$PUBLIC_DOMAIN" ]; then
+    safe_kv_set "$envf" "MISP_BASEURL" "https://${PUBLIC_DOMAIN}"
+  else
+    safe_kv_set "$envf" "MISP_BASEURL" "https://localhost"
+  fi
+
   umask 077
   {
     echo "MISP_ADMIN_EMAIL=$admin_email"
@@ -134,6 +227,7 @@ baseline_hardening_env() {
     echo "MISP_BASEURL=$(grep '^MISP_BASEURL=' .env | cut -d= -f2-)"
   } > ../misp_secure_credentials.txt
   chmod 600 ../misp_secure_credentials.txt
+  record_state wrote_secure_creds "1"
   log "Wrote generated secrets to misp_secure_credentials.txt"
 }
 
@@ -144,53 +238,76 @@ services:
     ports: []     # keep internal only
     logging:
       driver: json-file
-      options { max-size: "10m", max-file: "5" }
+      options:
+        max-size: "10m"
+        max-file: "5"
   misp:
-    depends_on: [misp-modules]
+    depends_on:
+      - misp-modules
     logging:
       driver: json-file
-      options { max-size: "10m", max-file: "5" }
+      options:
+        max-size: "10m"
+        max-file: "5"
 YAML
-  # fix YAML inline options to full keys
-  sed -i 's/options { /options:\n        /; s/, /\n        /g; s/ }//' docker-compose.override.yml
+  record_state wrote_override "1"
   log "Wrote docker-compose.override.yml"
 }
 
 compose_up() {
-  log "Pulling images"; $COMPOSE_BIN pull | tee -a "$LOG_FILE"
-  log "Starting containers detached"; $COMPOSE_BIN up -d | tee -a "$LOG_FILE"
+  log "Pulling images"
+  $COMPOSE_BIN pull | tee -a "$LOG_FILE"
+  log "Starting containers detached"
+  $COMPOSE_BIN up -d | tee -a "$LOG_FILE"
 }
 
 wait_for_http() {
   local url="${1:-https://localhost}"
   local deadline=$(( $(date +%s) + WAIT_TIMEOUT ))
-  log "Waiting for MISP to respond at $url (timeout ${WAIT_TIMEOUT}s)"
+  log "Waiting for MISP to respond at $url with timeout ${WAIT_TIMEOUT}s"
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    if curl -k -s -o /dev/null -w "%{http_code}" "$url" | grep -qE '^(200|302|401|403)$'; then log "MISP endpoint is responding"; return 0; fi
+    if curl -k -s -o /dev/null -w "%{http_code}" "$url" | grep -qE '^(200|302|401|403)$'; then
+      log "MISP endpoint is responding"
+      return 0
+    fi
     sleep "$SLEEP_SECS"
   done
   fail "Timed out waiting for $url"
 }
 
-find_container_by_service() { docker ps --filter "label=com.docker.compose.service=${1}" --format '{{.ID}}' | head -n1; }
+find_container_by_service() {
+  local svc="$1"
+  docker ps --filter "label=com.docker.compose.service=${svc}" --format '{{.ID}}' | head -n1
+}
 find_misp_app_container() {
   local cid; cid="$(find_container_by_service misp)"
-  if [ -z "$cid" ]; then cid="$(docker ps --format '{{.ID}} {{.Names}}' | awk '/misp/ && !/proxy/ {print $1}' | head -n1)"; fi
+  if [ -z "$cid" ]; then
+    cid="$(docker ps --format '{{.ID}} {{.Names}}' | awk '/misp/ && !/proxy/ {print $1}' | head -n1)"
+  fi
   echo "$cid"
 }
 find_misp_modules_container() {
   local cid; cid="$(find_container_by_service misp-modules)"
-  if [ -z "$cid" ]; then cid="$(docker ps --format '{{.ID}} {{.Names}}' | awk '/modules/ && /misp/ {print $1}' | head -n1)"; fi
+  if [ -z "$cid" ]; then
+    cid="$(docker ps --format '{{.ID}} {{.Names}}' | awk '/modules/ && /misp/ {print $1}' | head -n1)"
+  fi
   echo "$cid"
 }
 
 ensure_misp_modules_running() {
   local cid; cid="$(find_misp_modules_container)"
-  if [ -z "$cid" ]; then log "Starting misp-modules"; $COMPOSE_BIN up -d misp-modules | tee -a "$LOG_FILE"; sleep 3; cid="$(find_misp_modules_container)"; fi
-  [ -n "$cid" ] || fail "misp-modules container not found"
+  if [ -z "$cid" ]; then
+    log "misp-modules container not found. Starting misp-modules service."
+    $COMPOSE_BIN up -d misp-modules | tee -a "$LOG_FILE"
+    sleep 3
+    cid="$(find_misp_modules_container)"
+    [ -n "$cid" ] || fail "Could not start misp-modules container"
+  else
+    log "misp-modules container running: $cid"
+  fi
   docker exec -i "$cid" bash -lc "curl -sSf http://127.0.0.1:6666/modules | head -c 200 >/dev/null" \
     && log "misp-modules endpoint reachable internally" \
-    || log "Note: misp-modules HTTP check did not return successfully yet"
+    || log "misp-modules HTTP check not successful yet"
   echo "$cid"
 }
 
@@ -201,18 +318,28 @@ install_ai_module_into_misp_modules() {
     set -euo pipefail
     command -v git >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates)
     mkdir -p '$AI_WORKDIR'
-    if [ -d '$AI_WORKDIR/.git' ]; then git -C '$AI_WORKDIR' pull --ff-only || true
-    else git clone --depth 1 '$AI_REPO_URL' '$AI_WORKDIR'; fi
-    if command -v pip3 >/dev/null 2>&1; then pip3 install -r '$AI_WORKDIR/$AI_REQS_REL'
-    elif command -v pip >/dev/null 2>&1; then pip install -r '$AI_WORKDIR/$AI_REQS_REL'
-    else apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip && pip3 install -r '$AI_WORKDIR/$AI_REQS_REL'; fi
+    if [ -d '$AI_WORKDIR/.git' ]; then
+      git -C '$AI_WORKDIR' pull --ff-only || true
+    else
+      git clone --depth 1 '$AI_REPO_URL' '$AI_WORKDIR'
+    fi
+    if command -v pip3 >/dev/null 2>&1; then
+      pip3 install -r '$AI_WORKDIR/$AI_REQS_REL'
+    elif command -v pip >/dev/null 2>&1; then
+      pip install -r '$AI_WORKDIR/$AI_REQS_REL'
+    else
+      apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip
+      pip3 install -r '$AI_WORKDIR/$AI_REQS_REL'
+    fi
     py_site=\$(python3 -c 'import site; print([p for p in site.getsitepackages() if "site-packages" in p][0])')
     mod_dst=\"\$py_site/misp_modules/modules/expansion\"
     mkdir -p \"\$mod_dst\"
     cp '$AI_MODULE_REL' \"\$mod_dst/\"
     echo \"Installed ai_event_analysis.py to \$mod_dst\"
   " | tee -a "$LOG_FILE"
-  log "Restarting misp-modules"; docker restart "$cid" | tee -a "$LOG_FILE"
+
+  log "Restarting misp-modules to load the new module"
+  docker restart "$cid" | tee -a "$LOG_FILE"
 }
 
 enable_modules_in_misp_app() {
@@ -235,10 +362,22 @@ enable_modules_in_misp_app() {
   " | tee -a "$LOG_FILE"
 }
 
+ensure_ufw() {
+  if ! command -v ufw >/dev/null 2>&1; then install_pkg ufw; fi
+  sudo ufw allow 22/tcp || true
+  sudo ufw allow 80/tcp || true
+  sudo ufw allow 443/tcp || true
+  echo "y" | sudo ufw enable || true
+  sudo ufw status verbose | tee -a "$LOG_FILE"
+}
+
 tls_proxy_setup() {
   [ "$HARDEN_TLS" = "true" ] || return 0
-  if [ -z "$PUBLIC_DOMAIN" ] || [ -z "$ACME_EMAIL" ]; then log "TLS requested but PUBLIC_DOMAIN or ACME_EMAIL missing. Skipping."; return 0; fi
-  log "Configuring Caddy reverse proxy for ${PUBLIC_DOMAIN}"
+  if [ -z "$PUBLIC_DOMAIN" ] || [ -z "$ACME_EMAIL" ]; then
+    log "HARDEN_TLS requested but PUBLIC_DOMAIN or ACME_EMAIL missing. Skipping TLS proxy."
+    return 0
+  fi
+  log "Configuring Caddy reverse proxy for ${PUBLIC_DOMAIN} with ACME email ${ACME_EMAIL}"
   mkdir -p caddy
   cat > caddy/Caddyfile <<EOF
 {
@@ -258,19 +397,30 @@ services:
   caddy:
     image: caddy:2
     restart: unless-stopped
-    ports: ["80:80","443:443"]
+    ports:
+      - "80:80"
+      - "443:443"
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
-    depends_on: [misp]
-    networks: [default]
+    depends_on:
+      - misp
+    networks:
+      - default
 YAML
   $COMPOSE_BIN -f docker-compose.yml -f caddy/docker-compose.caddy.yml up -d | tee -a "$LOG_FILE"
+  log "Caddy proxy started. Public URL: https://${PUBLIC_DOMAIN}"
 }
 
 print_access_info() {
-  log "Access:"
-  if [ "$HARDEN_TLS" = "true" ] && [ -n "$PUBLIC_DOMAIN" ]; then log "Public URL: https://${PUBLIC_DOMAIN}"; else log "Local URL: https://localhost"; fi
-  log "Credentials saved to misp_secure_credentials.txt"
+  log "Access"
+  if [ "$HARDEN_TLS" = "true" ] && [ -n "$PUBLIC_DOMAIN" ]; then
+    log "Public URL: https://${PUBLIC_DOMAIN}"
+  else
+    log "Local URL: https://localhost"
+  fi
+  if [ -f "../misp_secure_credentials.txt" ]; then
+    log "Generated credentials saved to misp_secure_credentials.txt. Change them as needed."
+  fi
 }
 
 drop_into_app_shell() {
@@ -291,31 +441,120 @@ maybe_clone_into_app_and_attach() {
       set -euo pipefail
       command -v git >/dev/null 2>&1 || (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y git ca-certificates)
       mkdir -p '$INSIDE_APP_CLONE_DIR'
-      if [ -d '$INSIDE_APP_CLONE_DIR/.git' ]; then git -C '$INSIDE_APP_CLONE_DIR' pull --ff-only || true
-      else git clone --depth 1 '$AI_REPO_URL' '$INSIDE_APP_CLONE_DIR'; fi
+      if [ -d '$INSIDE_APP_CLONE_DIR/.git' ]; then
+        git -C '$INSIDE_APP_CLONE_DIR' pull --ff-only || true
+      else
+        git clone --depth 1 '$AI_REPO_URL' '$INSIDE_APP_CLONE_DIR'
+      fi
     " | tee -a "$LOG_FILE"
   fi
-  if [ "$AUTO_ATTACH_APP_SHELL" = "true" ]; then drop_into_app_shell "$app_cid"; fi
+  if [ "$AUTO_ATTACH_APP_SHELL" = "true" ]; then
+    drop_into_app_shell "$app_cid"
+  fi
+}
+
+# =========================================
+# Destroy mode
+# =========================================
+destroy_all() {
+  log "Destroy requested"
+
+  # Compose down with volumes for main stack
+  if [ -d "$TARGET_DIR" ]; then
+    pushd "$TARGET_DIR" >/dev/null
+    if [ -f docker-compose.yml ]; then
+      log "Bringing down docker compose stack with volumes"
+      $COMPOSE_BIN down -v --remove-orphans | tee -a "$LOG_FILE" || true
+    fi
+    # Caddy stack if present
+    if [ -f caddy/docker-compose.caddy.yml ]; then
+      log "Bringing down Caddy proxy stack"
+      $COMPOSE_BIN -f docker-compose.yml -f caddy/docker-compose.caddy.yml down -v --remove-orphans | tee -a "$LOG_FILE" || true
+    fi
+    popd >/dev/null
+
+    # Remove cloned repo if we created it
+    if [ "$(read_state created_env || echo 0)" = "1" ] || [ ! -d "$TARGET_DIR/.git" ]; then
+      log "Removing ${TARGET_DIR} directory"
+      rm -rf "$TARGET_DIR"
+    fi
+  fi
+
+  # Delete generated files
+  log "Removing generated files"
+  rm -f misp_secure_credentials.txt .misp_dev_state "$LOG_FILE" 2>/dev/null || true
+
+  # Try to remove any stray containers by label
+  log "Pruning stray containers, networks, and volumes (safe prune)"
+  docker container prune -f >/dev/null 2>&1 || true
+  docker network prune -f >/dev/null 2>&1 || true
+  docker volume prune -f >/dev/null 2>&1 || true
+
+  # Optional docker uninstall only if we installed it
+  if [ "$(read_state installed_docker || echo 0)" = "1" ] && [ "$DOCKER_UNINSTALL" = "true" ]; then
+    if prompt_yes "Uninstall Docker CE and related packages installed by this script"; then
+      log "Uninstalling Docker CE"
+      sudo systemctl stop docker || true
+      sudo apt-get purge -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || true
+      sudo apt-get autoremove -y || true
+      sudo rm -rf /var/lib/docker /var/lib/containerd || true
+      sudo rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.gpg || true
+    else
+      log "Docker uninstall skipped by user"
+    fi
+  fi
+
+  log "Destroy complete"
+}
+
+# =========================================
+# Main
+# =========================================
+usage() {
+  cat <<USAGE
+Usage:
+  $0                Build and configure MISP dev instance
+  ACTION=destroy $0 Destroy dev instance, remove containers, volumes, generated files
+Env knobs:
+  DEBUG=1, HARDEN_BASELINE=true, HARDEN_TLS=false, PUBLIC_DOMAIN=, ACME_EMAIL=, HARDEN_UFW=false
+  AUTO_CLONE_INSIDE_APP=true, AUTO_ATTACH_APP_SHELL=true
+  DOCKER_UNINSTALL=false (only if the script installed Docker)
+  NONINTERACTIVE=false
+USAGE
 }
 
 main() {
+  if [ "${ACTION:-}" = "destroy" ]; then
+    detect_compose || true
+    destroy_all
+    exit 0
+  fi
+
   log "Starting MISP dev environment with hardening"
   log "Log file: $LOG_FILE"
 
   make_helpers_executable
   check_prereqs
+  check_github_connectivity
   clone_repo
+  log "Starting prepare_env"
   prepare_env
+  log "Applying baseline hardening and override"
   if [ "$HARDEN_BASELINE" = "true" ]; then baseline_hardening_env; write_compose_override; fi
+  log "Bringing up docker compose"
   compose_up
+  log "Waiting for HTTPS endpoint"
   wait_for_http "https://localhost"
-  [ "$HARDEN_TLS" = "true" ] && tls_proxy_setup
-  [ "$HARDEN_UFW" = "true" ] && ensure_ufw
 
+  if [ "$HARDEN_TLS" = "true" ]; then tls_proxy_setup; fi
+  if [ "$HARDEN_UFW" = "true" ]; then ensure_ufw; fi
+
+  log "Ensuring misp-modules running"
   local modules_cid app_cid
   modules_cid="$(ensure_misp_modules_running)"
   app_cid="$(find_misp_app_container)"; [ -n "$app_cid" ] || fail "MISP app container not found"
 
+  log "Installing AI module and enabling plugins"
   install_ai_module_into_misp_modules "$modules_cid"
   enable_modules_in_misp_app "$app_cid"
 
@@ -324,5 +563,9 @@ main() {
 
   log "Done"
 }
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  usage; exit 0
+fi
 
 main "$@"
